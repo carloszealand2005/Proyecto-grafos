@@ -1,7 +1,7 @@
 # Script para modificar los accidentes de tránsito de londres
 
 library(dplyr)
-accidentes = read.csv("Segundo proyecto/londres_accidentes_5years.csv")
+accidentes = read.csv("Files/londres_accidentes_5years.csv")
 
 str(accidentes)
 

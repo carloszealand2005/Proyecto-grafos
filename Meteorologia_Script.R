@@ -15,7 +15,7 @@ library(jsonlite)
 # ==============================================================================
 
 # Cargar dataset original (asegúrate de que la ruta coincida con tu carpeta en RStudio)
-accidentes_raw <- read.csv("C:/Users/nadie/Documents/Guardar/U/Ciclo 7/Interoperabilidad y explotacion de datos/londres_accidentes_5years.csv", stringsAsFactors = FALSE)
+accidentes_raw <- read.csv("C:/Users/V I C T U S/OneDrive/Desktop/Proyecto datos/Files/londres_accidentes_5years.csv", stringsAsFactors = FALSE)
 
 # Seleccionar las 15 variables relevantes definidas en el Entregable 2
 variables <- c(
@@ -145,9 +145,17 @@ dataset_integrado_londres <- accidentes_limpios %>%
 ejemplo_mayo <- subset(dataset_integrado_londres, date == as.Date("2025-05-15"))
 print(head(ejemplo_mayo[, c("collision_index", "date", "time", "severidad_desc", "clima_id", "temp_promedio_c", "precipitacion_mm")], 5))
 
+
+# Vista previa
+str(dataset_integrado_londres)
+View(dataset_integrado_londres)
 # Guardar los tres archivos CSV resultantes para el modelado del Grafo
-write.csv(accidentes_limpios, "accidentes_inglaterra_limpio.csv", row.names = FALSE)
-write.csv(clima_londres, "clima_londres_2021_2025.csv", row.names = FALSE)
-write.csv(dataset_integrado_londres, "dataset_integrado_londres.csv", row.names = FALSE)
+
+# MODIFICAR LA PATH SI SE USA DE FORMA LOCAL. 
+path <- "C:/Users/V I C T U S/OneDrive/Desktop/Proyecto datos/Files"
+
+write.csv(accidentes_limpios, file.path(path, "accidentes_inglaterra_limpio.csv"), row.names = FALSE)
+write.csv(clima_londres, file.path(path, "clima_londres_2021_2025.csv"), row.names = FALSE)
+write.csv(dataset_integrado_londres, file.path(path, "dataset_integrado_londres.csv"), row.names = FALSE)
 
 cat("¡Proceso finalizado! Archivos exportados en el directorio de trabajo.\n")
