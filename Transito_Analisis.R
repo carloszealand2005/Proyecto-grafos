@@ -115,3 +115,19 @@ summary(accidentes)
 accidentes[
   accidentes$number_of_casualties == max(accidentes$number_of_casualties, na.rm = TRUE),
 ]
+
+table(accidentes$collision_severity, useNA = "ifany")
+table(accidentes$road_type, useNA = "ifany")
+table(accidentes$light_conditions, useNA = "ifany")
+table(accidentes$weather_conditions, useNA = "ifany")
+table(accidentes$road_surface_conditions, useNA = "ifany")
+table(accidentes$urban_or_rural_area, useNA = "ifany")
+
+
+# Eliminar registros que no tienen ubicación ni fecha
+accidentes_limpios <- subset(
+  accidentes,
+  !is.na(latitude) & !is.na(longitude) & !is.na(date) 
+)
+
+ 
