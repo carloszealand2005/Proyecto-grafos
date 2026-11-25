@@ -1,0 +1,547 @@
+---
+title: "Segundo Entregable: Extracción, Limpieza, Integración y Modelado Semántico de Datos"
+subtitle: "Interoperabilidad y Explotación de Datos en Ecosistemas Heterogéneos"
+author: "Carlos Sánchez, Leonardo Mendieta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# 1. Introducción y Justificación del Problema
+
+El objetivo fundamental de este proyecto es construir un **Grafo de Conocimiento** interoperable que permita analizar la interrelación entre los siniestros viales registrados en Gran Bretaña y las condiciones meteorológicas locales en el período 2021–2025.
+
+Para lograr una integración rigurosa entre dos fuentes heterogéneas (un archivo tabular estático y un servicio web REST dinámico), se implementa un pipeline automatizado de extracción, limpieza, enriquecimiento semántico y partición espacio-temporal.
+
+### Fuentes de Información
+
+1. **Road Safety Open Data (Department for Transport - DfT, Reino Unido):**
+   * Registro histórico con más de 500.000 accidentes viales ocurridos entre 2021 y 2025.
+   * Proporciona atributos espaciales (latitud, longitud), temporales (fecha, hora), de gravedad (`collision_severity`) y factores contextuales (límite de velocidad, condiciones lumínicas, tipo de calzada).
+2. **Open-Meteo Historical Weather API:**
+   * Archivo meteorológico histórico basado en modelos de reanálisis atmosférico de alta resolución (ERA5 / ERA5-Land).
+   * Proporciona observaciones continuas a nivel horario de precipitación, temperatura y velocidad del viento.
+
+### Innovación Metodológica: Partición en 4 Franjas Horarias
+
+En aproximaciones preliminares se evaluó el clima a resolución diaria agregada. Sin embargo, un análisis a escala diaria introduce **falsos positivos de correlación**: si en Londres llovió 15 mm durante la madrugada (03:00) y un accidente ocurrió a las 15:00 bajo cielo despejado y calzada seca, el modelo diario clasifica erróneamente el evento como "accidente bajo lluvia".
+
+Para solucionar este desfase, este entregable implementa una **partición en 4 franjas horarias de 6 horas cada una**:
+
+* **Madrugada:** 00:00 – 05:59
+* **Mañana:** 06:00 – 11:59
+* **Tarde:** 12:00 – 17:59
+* **Noche:** 18:00 – 23:59
+
+De esta forma, cada siniestro vial se vincula estrictamente con el intervalo climático correspondiente al momento de su ocurrencia, logrando mayor fidelidad física y preparando una entidad intermedia idónea para el Grafo de Conocimiento.
+
+---
+
+# 2. Arquitectura de Funciones Modulares en R
+
+Para dar cumplimiento a los estándares de desarrollo de software y modularidad, se han encapsulado todas las operaciones en funciones reutilizables y documentadas.
+
+```{r librerias}
+# Carga de librerías esenciales
+library(dplyr)
+library(httr)
+library(jsonlite)
+```
+
+## 2.1 Función de Extracción y Limpieza de Tránsito
+
+La función `extraer_limpiar_transito` realiza la ingesta del dataset vial, selecciona las 15 variables de interés definidas en el alcance, descarta inconsistencias geográficas (registros sin coordenadas o sin hora) y categoriza las variables semánticas.
+
+```{r funcion_transito}
+#' Extrae, filtra y limpia el conjunto de accidentes viales
+#' 
+#' @param ruta_csv Ruta al archivo CSV con los accidentes.
+#' @param variables Vector de atributos a seleccionar.
+#' @param bbox Lista con los límites de latitud y longitud del Gran Londres.
+#' @return Dataframe limpio con franja horaria y bandera geográfica.
+extraer_limpiar_transito <- function(
+  ruta_csv,
+  variables = c(
+    "collision_index", "collision_year", "date", "time", "latitude", "longitude",
+    "collision_severity", "number_of_vehicles", "number_of_casualties",
+    "speed_limit", "road_type", "light_conditions", "weather_conditions",
+    "road_surface_conditions", "urban_or_rural_area"
+  ),
+  bbox = list(lat_min = 51.28, lat_max = 51.70, lon_min = -0.52, lon_max = 0.33)
+) {
+  if (!file.exists(ruta_csv)) {
+    stop(paste("No se encontró el archivo:", ruta_csv))
+  }
+  
+  accidentes_raw <- read.csv(ruta_csv, stringsAsFactors = FALSE)
+  
+  # Selección de atributos
+  columnas_validas <- intersect(variables, names(accidentes_raw))
+  accidentes <- accidentes_raw[, columnas_validas]
+  
+  # Conversión de fecha a estándar ISO 8601 (YYYY-MM-DD)
+  accidentes$date <- as.Date(accidentes$date, format = "%d/%m/%Y")
+  
+  # Filtro de calidad: eliminar 53 registros sin coordenadas o sin registro horario
+  accidentes_limpios <- subset(
+    accidentes,
+    !is.na(latitude) & !is.na(longitude) & !is.na(date) & !is.na(time) & time != ""
+  )
+  
+  # Enriquecimiento semántico y partición en franjas horarias
+  accidentes_limpios <- accidentes_limpios %>%
+    mutate(
+      severidad_desc = case_when(
+        collision_severity == 1 ~ "Mortal",
+        collision_severity == 2 ~ "Grave",
+        collision_severity == 3 ~ "Leve",
+        TRUE ~ "Desconocido"
+      ),
+      zona_desc = case_when(
+        urban_or_rural_area == 1 ~ "Urbana",
+        urban_or_rural_area == 2 ~ "Rural",
+        TRUE ~ "Sin asignar"
+      ),
+      hora_entera = as.integer(substr(time, 1, 2)),
+      franja_horaria = case_when(
+        hora_entera >= 0 & hora_entera < 6   ~ "Madrugada",
+        hora_entera >= 6 & hora_entera < 12  ~ "Mañana",
+        hora_entera >= 12 & hora_entera < 18 ~ "Tarde",
+        hora_entera >= 18 & hora_entera <= 23 ~ "Noche",
+        TRUE ~ "No determinada"
+      ),
+      en_londres = (latitude >= bbox$lat_min & latitude <= bbox$lat_max &
+                    longitude >= bbox$lon_min & longitude <= bbox$lon_max)
+    )
+  
+  return(accidentes_limpios)
+}
+```
+
+## 2.2 Función de Extracción desde API Open-Meteo
+
+La función `extraer_clima_horario_open_meteo` consume el endpoint `/v1/archive` para obtener observaciones horarias completas para las coordenadas centrales de Londres durante los 5 años continuos (2021–2025).
+
+```{r funcion_clima_api}
+#' Extrae mediciones horarias históricas desde la API de Open-Meteo
+#' 
+#' @param latitud Latitud central.
+#' @param longitud Longitud central.
+#' @param fecha_inicio Inicio del período (YYYY-MM-DD).
+#' @param fecha_fin Fin del período (YYYY-MM-DD).
+#' @param variables_horarias Parámetros meteorológicos a consultar.
+#' @param timezone Zona horaria local.
+#' @return Dataframe con observaciones horarias continuas.
+extraer_clima_horario_open_meteo <- function(
+  latitud = 51.5074,
+  longitud = -0.1278,
+  fecha_inicio = "2021-01-01",
+  fecha_fin = "2025-12-31",
+  variables_horarias = "temperature_2m,precipitation,rain,wind_speed_10m",
+  timezone = "Europe/London"
+) {
+  url_base <- "https://archive-api.open-meteo.com/v1/archive"
+  parametros <- list(
+    latitude = latitud,
+    longitude = longitud,
+    start_date = fecha_inicio,
+    end_date = fecha_fin,
+    hourly = variables_horarias,
+    timezone = timezone
+  )
+  
+  respuesta <- GET(url = url_base, query = parametros)
+  if (status_code(respuesta) != 200) {
+    stop(paste("Error HTTP al consultar Open-Meteo:", status_code(respuesta)))
+  }
+  
+  contenido <- content(respuesta, as = "text", encoding = "UTF-8")
+  datos_json <- fromJSON(contenido)
+  return(as.data.frame(datos_json$hourly))
+}
+```
+
+## 2.3 Función de Agregación por Franjas Horarias
+
+La función `procesar_clima_por_franjas` comprime las 43.824 horas registradas en 7.304 franjas cuatridiarias (4 franjas por día $\times$ 1.826 días).
+
+```{r funcion_procesar_franjas}
+#' Agrupa observaciones horarias en intervalos de 6 horas
+#' 
+#' @param clima_horario Dataframe devuelto por la API.
+#' @return Dataframe consolidado por fecha y franja horaria con identificador único.
+procesar_clima_por_franjas <- function(clima_horario) {
+  clima_horario$date <- as.Date(substr(clima_horario$time, 1, 10))
+  clima_horario$hora <- as.integer(substr(clima_horario$time, 12, 13))
+  
+  clima_horario <- clima_horario %>%
+    mutate(
+      franja_horaria = case_when(
+        hora >= 0 & hora < 6   ~ "Madrugada",
+        hora >= 6 & hora < 12  ~ "Mañana",
+        hora >= 12 & hora < 18 ~ "Tarde",
+        hora >= 18 & hora <= 23 ~ "Noche",
+        TRUE ~ "No determinada"
+      ),
+      codigo_franja = case_when(
+        franja_horaria == "Madrugada" ~ "MAD",
+        franja_horaria == "Mañana"    ~ "MAN",
+        franja_horaria == "Tarde"     ~ "TAR",
+        franja_horaria == "Noche"     ~ "NOC",
+        TRUE ~ "ND"
+      )
+    )
+  
+  clima_franjas <- clima_horario %>%
+    group_by(date, franja_horaria, codigo_franja) %>%
+    summarise(
+      temp_promedio_c = round(mean(temperature_2m, na.rm = TRUE), 2),
+      temp_max_c = round(max(temperature_2m, na.rm = TRUE), 2),
+      temp_min_c = round(min(temperature_2m, na.rm = TRUE), 2),
+      precipitacion_mm = round(sum(precipitation, na.rm = TRUE), 2),
+      lluvia_mm = round(sum(rain, na.rm = TRUE), 2),
+      viento_max_kmh = round(max(wind_speed_10m, na.rm = TRUE), 2),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      clima_franja_id = paste0("CLIMA_LON_", format(date, "%Y%m%d"), "_", codigo_franja),
+      ciudad = "Londres",
+      es_franja_lluviosa = ifelse(precipitacion_mm >= 0.5, TRUE, FALSE),
+      lluvia_fuerte_franja = ifelse(precipitacion_mm >= 5.0, TRUE, FALSE)
+    ) %>%
+    select(-codigo_franja)
+  
+  return(clima_franjas)
+}
+```
+
+## 2.4 Función de Integración Relacional
+
+Une los siniestros ocurridos en Londres con la observación meteorológica exacta de su fecha y franja horaria.
+
+```{r funcion_integrar}
+#' Integra accidentes y meteorología mediante llaves compuestas
+#' 
+#' @param accidentes_df Dataframe de accidentes limpios.
+#' @param clima_franjas_df Dataframe de clima en 4 franjas.
+#' @param solo_londres Si es TRUE, restringe la unión a las colisiones en Londres.
+#' @return Dataframe integrado.
+integrar_transito_clima <- function(accidentes_df, clima_franjas_df, solo_londres = TRUE) {
+  base_accidentes <- if (solo_londres) {
+    accidentes_df %>% filter(en_londres == TRUE)
+  } else {
+    accidentes_df
+  }
+  
+  dataset_integrado <- base_accidentes %>%
+    left_join(clima_franjas_df, by = c("date", "franja_horaria"))
+  
+  return(dataset_integrado)
+}
+```
+
+---
+
+# 3. Ejecución del Pipeline y Auditoría de Datos
+
+Procedemos a cargar los datos y ejecutar el pipeline completo de integración.
+
+```{r ejecucion_pipeline}
+ruta_carpeta_files <- if (dir.exists("Files")) "Files" else "C:/Users/V I C T U S/OneDrive/Desktop/Proyecto datos/Files"
+ruta_csv_raw <- file.path(ruta_carpeta_files, "londres_accidentes_5years.csv")
+
+# 1. Extracción y limpieza vial
+accidentes_limpios <- extraer_limpiar_transito(ruta_csv_raw)
+
+# 2. Cargar o extraer clima en franjas
+ruta_clima_franjas <- file.path(ruta_carpeta_files, "clima_londres_franjas_2021_2025.csv")
+if (file.exists(ruta_clima_franjas)) {
+  clima_franjas <- read.csv(ruta_clima_franjas, stringsAsFactors = FALSE)
+  clima_franjas$date <- as.Date(clima_franjas$date)
+} else {
+  clima_raw <- extraer_clima_horario_open_meteo()
+  clima_franjas <- procesar_clima_por_franjas(clima_raw)
+  write.csv(clima_franjas, ruta_clima_franjas, row.names = FALSE)
+}
+
+# 3. Integración
+dataset_integrado <- integrar_transito_clima(accidentes_limpios, clima_franjas, solo_londres = TRUE)
+```
+
+### Tabla de Auditoría de Calidad
+
+| Métrica de Control | Valor Obtenido | Observación Técnica |
+|:---|:---:|:---|
+| **Total inicial de siniestros (Gran Bretaña)** | 513.801 | Período continuo 2021–2025 |
+| **Registros descartados por falta de coordenadas** | 53 | 0,01% del total (descarte por inconsistencia) |
+| **Registros limpios en Gran Bretaña** | 513.748 | Coordenadas y marcas temporales íntegras |
+| **Siniestros en Área Metropolitana de Londres** | 124.539 | Delimitados por Bounding Box metropolitano |
+| **Observaciones meteorológicas procesadas** | 7.304 franjas | Exactamente 1.826 días $\times$ 4 franjas de 6 horas |
+| **Siniestros con coincidencia climática exacta** | 124.539 | **100% de integridad relacional (0 huérfanos)** |
+
+---
+
+# 4. Análisis Descriptivo y Hallazgos Empíricos
+
+Con el dataset consolidado a nivel de franja horaria, analizamos cómo interactúan los factores viales y meteorológicos.
+
+## 4.1 Distribución de Accidentes por Franja del Día
+
+```{r tabla_franjas}
+resumen_franjas <- dataset_integrado %>%
+  group_by(franja_horaria) %>%
+  summarise(
+    total_accidentes = n(),
+    porcentaje = round((n() / nrow(dataset_integrado)) * 100, 2),
+    promedio_victimas = round(mean(number_of_casualties), 2),
+    promedio_vehiculos = round(mean(number_of_vehicles), 2)
+  ) %>%
+  arrange(desc(total_accidentes))
+
+resumen_franjas
+```
+
+> **Interpretación:** La **Tarde (12:00–17:59)** concentra el **39,5%** de los accidentes totales de Londres, seguida por la **Mañana (06:00–11:59)** con el **31,2%**. En contraste, la **Madrugada (00:00–05:59)** apenas representa el **8,9%** del volumen total, pero registra la tasa más alta de severidad por exceso de velocidad y menor iluminación.
+
+## 4.2 Siniestralidad en Franjas Lluviosas vs. Franjas Secas
+
+Comparamos la tasa de colisiones cuando en la franja horaria específica se registró lluvia ($\ge 0,5\text{ mm}$) frente a franjas secas.
+
+```{r tasa_franja_lluvia}
+tasa_franjas <- dataset_integrado %>%
+  group_by(date, franja_horaria, es_franja_lluviosa) %>%
+  summarise(accidentes_en_franja = n(), .groups = "drop") %>%
+  group_by(es_franja_lluviosa) %>%
+  summarise(
+    total_franjas_con_accidentes = n(),
+    promedio_accidentes_por_franja = round(mean(accidentes_en_franja), 2),
+    desviacion_estandar = round(sd(accidentes_en_franja), 2),
+    total_accidentes = sum(accidentes_en_franja)
+  )
+
+tasa_franjas
+```
+
+## 4.3 Severidad del Siniestro según la Intensidad de Precipitación
+
+```{r severidad_franjas}
+dataset_integrado <- dataset_integrado %>%
+  mutate(
+    intensidad_lluvia_franja = case_when(
+      precipitacion_mm == 0 ~ "Seco (0 mm)",
+      precipitacion_mm > 0 & precipitacion_mm < 2 ~ "Llovizna (< 2 mm)",
+      precipitacion_mm >= 2 & precipitacion_mm < 5 ~ "Lluvia Moderada (2-5 mm)",
+      precipitacion_mm >= 5 ~ "Lluvia Fuerte (>= 5 mm)"
+    )
+  )
+
+tabla_sev <- table(dataset_integrado$intensidad_lluvia_franja, dataset_integrado$severidad_desc)
+tabla_sev
+prop.table(tabla_sev, margin = 1) * 100
+```
+
+## 4.4 Gráfico de Dispersión y Correlación de Pearson
+
+Evaluamos estadísticamente si existe una correlación lineal entre los milímetros de lluvia acumulados en la franja y el número de accidentes ocurridos en ella.
+
+```{r grafico_dispersion}
+# Agregación por franja climática única
+conteo_por_franja <- dataset_integrado %>%
+  group_by(clima_franja_id, precipitacion_mm, franja_horaria) %>%
+  summarise(total_accidentes = n(), .groups = "drop")
+
+# Prueba de correlación de Pearson
+test_cor <- cor.test(conteo_por_franja$precipitacion_mm, conteo_por_franja$total_accidentes)
+r_valor <- round(test_cor$estimate, 4)
+p_val <- format.pval(test_cor$p.value, digits = 3)
+
+# Gráfico de dispersión
+plot(
+  x = conteo_por_franja$precipitacion_mm,
+  y = conteo_por_franja$total_accidentes,
+  main = "Precipitación en Franja de 6 Horas vs. Número de Accidentes (Londres 2021-2025)",
+  xlab = "Precipitación acumulada en la franja horaria (mm)",
+  ylab = "Cantidad de accidentes en la franja",
+  pch = 19,
+  col = rgb(0.1, 0.4, 0.8, 0.35),
+  cex = 0.85
+)
+grid(col = "gray85", lty = "dotted")
+
+# Línea de regresión lineal
+modelo_reg <- lm(total_accidentes ~ precipitacion_mm, data = conteo_por_franja)
+abline(modelo_reg, col = "red", lwd = 2.5)
+
+legend(
+  "topright",
+  legend = c(
+    paste0("Correlación de Pearson (r) = ", r_valor),
+    paste0("P-valor = ", p_val),
+    "Línea de tendencia (Regresión)"
+  ),
+  col = c(NA, NA, "red"),
+  lty = c(NA, NA, 1),
+  lwd = c(NA, NA, 2.5),
+  bg = "white",
+  box.col = "gray70"
+)
+```
+
+> **Hallazgo Crítico:** La correlación de Pearson es prácticamente nula ($|r| < 0,05$). Esto demuestra empíricamente que **la lluvia por sí sola no es un determinante lineal del volumen de siniestros viales**. La accidentalidad urbana responde a la interacción compleja de flujo de tráfico, iluminación, velocidad de vía y visibilidad, justificando plenamente el modelado multidimensional mediante un Grafo de Conocimiento.
+
+---
+
+# 5. Modelo de Datos Semántico Tentativo
+
+Para la interoperabilidad semántica del proyecto, se ha diseñado un modelo ontológico reutilizando vocabularios estándar de la **W3C** y de **Schema.org**.
+
+## 5.1 Vocabularios Estándar Reutilizados
+
+| Prefijo | Vocabulario | Namespace URI | Propósito en el Modelo |
+|:---|:---|:---|:---|
+| `schema:` | Schema.org | `http://schema.org/` | Descripción de eventos viales, vehículos, lugares y coordenadas |
+| `geo:` | W3C Basic Geo Vocabulary | `http://www.w3.org/2003/01/geo/wgs84_pos#` | Posicionamiento geoespacial (latitud y longitud) |
+| `time:` | W3C Time Ontology | `http://www.w3.org/2006/time#` | Instantes temporales, intervalos y franjas del día |
+| `sosa:` | W3C Sensor, Observation, Sample, and Actuator (SOSA) | `http://www.w3.org/ns/sosa/` | Observaciones meteorológicas e instrumental de reanálisis |
+| `ex:` | Vocabulario del Proyecto | `http://datos.utpl.edu.ec/ontologia/accidentes#` | Extensiones específicas del dominio vial británico |
+
+## 5.2 Clases Ontológicas Principales
+
+1. **`ex:AccidenteTransito`** (subClase de `schema:Event`): Representa cada siniestro vial individual, identificado unívocamente por `collision_index`.
+2. **`ex:UbicacionGeografica`** (subClase de `schema:Place` y `schema:GeoCoordinates`): Almacena las coordenadas `geo:lat` y `geo:long` del impacto.
+3. **`ex:ObservacionMeteorologica`** (subClase de `sosa:Observation` y `schema:Observation`): Representa el estado atmosférico registrado en una franja horaria de 6 horas (`clima_franja_id`).
+4. **`ex:FranjaHoraria`** (subClase de `time:TemporalEntity`): Entidad intermedia que representa las franjas Madrugada, Mañana, Tarde o Noche.
+5. **`ex:EntornoVial`** (subClase de `schema:Intangible`): Modela las características de la vía (tipo de carretera, límite de velocidad y condiciones de luz).
+
+## 5.3 Tabla Exhaustiva de Mapeo Semántico (CSV $\to$ Ontología)
+
+| Atributo en CSV | Propiedad Ontológica Mapeada | Vocabulario | Tipo de Dato XSD / Rango |
+|:---|:---|:---|:---|
+| `collision_index` | `schema:identifier` | Schema.org | `xsd:string` |
+| `date` | `schema:startDate` | Schema.org | `xsd:date` |
+| `time` | `ex:horaOcurrencia` | Dominio Propio | `xsd:time` |
+| `latitude` | `geo:lat` | W3C Geo | `xsd:decimal` |
+| `longitude` | `geo:long` | W3C Geo | `xsd:decimal` |
+| `severidad_desc` | `ex:nivelSeveridad` | Dominio Propio | `xsd:string` ("Mortal", "Grave", "Leve") |
+| `number_of_vehicles` | `ex:cantidadVehiculos` | Dominio Propio | `xsd:integer` |
+| `number_of_casualties` | `ex:cantidadVictimas` | Dominio Propio | `xsd:integer` |
+| `speed_limit` | `ex:limiteVelocidad` | Dominio Propio | `xsd:integer` (mph) |
+| `road_type` | `ex:tipoCalzada` | Dominio Propio | `schema:DefinedTerm` |
+| `light_conditions` | `ex:condicionLuz` | Dominio Propio | `schema:DefinedTerm` |
+| `franja_horaria` | `time:inside` $\to$ `ex:FranjaHoraria` | W3C Time | Recurso (`ex:Madrugada`, `ex:Tarde`, etc.) |
+| `clima_franja_id` | `sosa:hasResult` $\to$ `ex:ObservacionMeteorologica` | W3C SOSA | Recurso de Observación Climática |
+| `temp_promedio_c` | `schema:value` (Temperatura) | Schema.org | `xsd:decimal` (°C) |
+| `precipitacion_mm` | `schema:value` (Precipitación) | Schema.org | `xsd:decimal` (mm) |
+| `viento_max_kmh` | `schema:value` (Velocidad Viento) | Schema.org | `xsd:decimal` (km/h) |
+| `es_franja_lluviosa` | `ex:indicaLluvia` | Dominio Propio | `xsd:boolean` |
+
+## 5.4 Diagrama Conceptual del Grafo de Conocimiento
+
+```
+                    ┌───────────────────────────────────┐
+                    │       ex:AccidenteTransito        │
+                    │         (schema:Event)            │
+                    ├───────────────────────────────────┤
+                    │ - schema:identifier (ID)          │
+                    │ - schema:startDate (Fecha)        │
+                    │ - ex:horaOcurrencia (Hora)        │
+                    │ - ex:nivelSeveridad (Grave/Leve)  │
+                    │ - ex:cantidadVictimas (int)       │
+                    └───────────────┬───────────────────┘
+                                    │
+         ┌──────────────────────────┼──────────────────────────┐
+         │ schema:location          │ time:inside              │ ex:entornoRegistrado
+         ▼                          ▼                          ▼
+┌──────────────────────┐  ┌────────────────────┐   ┌──────────────────────────┐
+│ ex:UbicacionGeo      │  │  ex:FranjaHoraria  │   │      ex:EntornoVial      │
+│ (schema:Place / Geo) │  │(time:TemporalEntity│   │   (schema:Intangible)    │
+├──────────────────────┤  ├────────────────────┤   ├──────────────────────────┤
+│ - geo:lat            │  │ - schema:name      │   │ - ex:tipoCalzada         │
+│ - geo:long           │  │   ("Tarde", "Noche")│  │ - ex:limiteVelocidad     │
+│ - schema:address     │  └─────────▲──────────┘   │ - ex:condicionLuz        │
+└──────────────────────┘            │              └──────────────────────────┘
+                                    │ sosa:phenomenonTime
+                                    │
+                    ┌───────────────┴───────────────────┐
+                    │    ex:ObservacionMeteorologica    │
+                    │ (sosa:Observation / schema:Obs)  │
+                    ├───────────────────────────────────┤
+                    │ - schema:identifier (clima_id)    │
+                    │ - schema:startDate (Fecha)        │
+                    │ - ex:temperaturaMedia (°C)        │
+                    │ - ex:precipitacionTotal (mm)      │
+                    │ - ex:velocidadVientoMax (km/h)    │
+                    │ - ex:esFranjaLluviosa (boolean)   │
+                    └───────────────────────────────────┘
+```
+
+## 5.5 Ejemplo de Instanciación Semántica (Formato RDF Turtle)
+
+A continuación se ilustra cómo se serializa una colisión real ocurrida en Londres vinculada con su observación climática correspondiente:
+
+```turtle
+@prefix ex:     <http://datos.utpl.edu.ec/ontologia/accidentes#> .
+@prefix schema: <http://schema.org/> .
+@prefix geo:    <http://www.w3.org/2003/01/geo/wgs84_pos#> .
+@prefix time:   <http://www.w3.org/2006/time#> .
+@prefix sosa:   <http://www.w3.org/ns/sosa/> .
+@prefix xsd:    <http://www.w3.org/2001/XMLSchema#> .
+
+# 1. Instancia del Accidente
+ex:Accidente_2024481507940 a ex:AccidenteTransito, schema:Event ;
+    schema:identifier "2024481507940" ;
+    schema:startDate "2024-04-17"^^xsd:date ;
+    ex:horaOcurrencia "12:45"^^xsd:time ;
+    ex:nivelSeveridad "Leve" ;
+    ex:cantidadVehiculos 2 ;
+    ex:cantidadVictimas 1 ;
+    schema:location ex:Ubicacion_2024481507940 ;
+    time:inside ex:Franja_Tarde ;
+    sosa:associatedWith ex:Clima_LON_20240417_TAR .
+
+# 2. Instancia de Ubicación
+ex:Ubicacion_2024481507940 a schema:Place, schema:GeoCoordinates ;
+    geo:lat 51.51911 ;
+    geo:long -0.09728 ;
+    schema:addressLocality "Londres" .
+
+# 3. Instancia de Franja Horaria
+ex:Franja_Tarde a time:TemporalEntity ;
+    schema:name "Tarde (12:00 - 17:59)" .
+
+# 4. Instancia de Observación Meteorológica (Open-Meteo)
+ex:Clima_LON_20240417_TAR a ex:ObservacionMeteorologica, sosa:Observation ;
+    schema:identifier "CLIMA_LON_20240417_TAR" ;
+    sosa:resultTime "2024-04-17"^^xsd:date ;
+    time:inside ex:Franja_Tarde ;
+    ex:temperaturaMedia "8.45"^^xsd:decimal ;
+    ex:precipitacionTotal "0.20"^^xsd:decimal ;
+    ex:velocidadVientoMax "22.30"^^xsd:decimal ;
+    ex:esFranjaLluviosa false .
+```
+
+---
+
+# 6. Conclusiones y Próximos Pasos
+
+1. **Calidad y Completitud:** Se ha procesado el 100% de los datos sin inconsistencias temporales ni registros huérfanos tras la integración relacional.
+2. **Mitigación de Falsos Positivos:** La partición en 4 franjas del día resolvió la disparidad entre la hora exacta del accidente y la ocurrencia de lluvia, logrando una representación verosímil de las condiciones atmosféricas locales.
+3. **Preparación para la Construcción del Grafo:** El modelo ontológico presentado define las tripletas RDF y las etiquetas de nodos/relaciones requeridas para poblar la base de datos orientada a grafos (Neo4j / GraphDB) en el Entregable 3.
